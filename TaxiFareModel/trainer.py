@@ -1,23 +1,24 @@
-# imports
+import joblib
+from termcolor import colored
 import mlflow
-from mlflow.tracking import MlflowClient
+from TaxiFareModel.data import get_data, get_data_from_gcp, clean_data
 from TaxiFareModel.encoders import TimeFeaturesEncoder, DistanceTransformer
-from TaxiFareModel.data import get_data,clean_data
 from TaxiFareModel.utils import compute_rmse
-from sklearn.linear_model import LinearRegression
-from sklearn.pipeline import Pipeline, make_pipeline
-from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import StandardScaler, RobustScaler
-from sklearn.model_selection import train_test_split
 from memoized_property import memoized_property
+from mlflow.tracking import MlflowClient
+from sklearn.compose import ColumnTransformer
+from sklearn.linear_model import LinearRegression
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from google.cloud import storage
+from TaxiFareModel.params import BUCKET_NAME, MODEL_NAME, MODEL_VERSION
 
 MLFLOW_URI = "https://mlflow.lewagon.co/"
-myname = "davidvenzke"
-EXPERIMENT_NAME = f"TaxifareModel_{myname}"
+EXPERIMENT_NAME = "first_experiment"
 
-class Trainer():
-    ESTIMATOR = 'Linear'
 
+class Trainer(object):
     def __init__(self, X, y):
         """
             X: pandas DataFrame
@@ -26,6 +27,7 @@ class Trainer():
         self.pipeline = None
         self.X = X
         self.y = y
+        # for MLFlow
         self.experiment_name = EXPERIMENT_NAME
 
     def set_experiment_name(self, experiment_name):
@@ -34,24 +36,30 @@ class Trainer():
 
     def set_pipeline(self):
         """defines the pipeline as a class attribute"""
-        pipe_distance = make_pipeline(DistanceTransformer(), RobustScaler())
-        pipe_time = make_pipeline(TimeFeaturesEncoder(time_column='pickup_datetime'), StandardScaler())
+        dist_pipe = Pipeline([
+            ('dist_trans', DistanceTransformer()),
+            ('stdscaler', StandardScaler())
+        ])
+        time_pipe = Pipeline([
+            ('time_enc', TimeFeaturesEncoder('pickup_datetime')),
+            ('ohe', OneHotEncoder(handle_unknown='ignore'))
+        ])
+        preproc_pipe = ColumnTransformer([
+            ('distance', dist_pipe, [
+                "pickup_latitude",
+                "pickup_longitude",
+                'dropoff_latitude',
+                'dropoff_longitude'
+            ]),
+            ('time', time_pipe, ['pickup_datetime'])
+        ], remainder="drop")
 
-        dist_cols = ['pickup_latitude', 'pickup_longitude', 'dropoff_latitude', 'dropoff_longitude']
-        time_cols = ['pickup_datetime']
-
-        preprocessor = ColumnTransformer([('time', pipe_time, time_cols),
-                                      ('distance', pipe_distance, dist_cols)]
-                                      )
-        # Add the model of your choice to the pipeline
-        final_pipe = Pipeline(steps=[('preprocessing', preprocessor),
-                                ('regressor', LinearRegression())])
-
-        # display the pipeline with model
-        self.pipeline = final_pipe
+        self.pipeline = Pipeline([
+            ('preproc', preproc_pipe),
+            ('linear_model', LinearRegression())
+        ])
 
     def run(self):
-        """set and train the pipeline"""
         self.set_pipeline()
         self.mlflow_log_param("model", "Linear")
         self.pipeline.fit(self.X, self.y)
@@ -59,10 +67,31 @@ class Trainer():
     def evaluate(self, X_test, y_test):
         """evaluates the pipeline on df_test and return the RMSE"""
         y_pred = self.pipeline.predict(X_test)
-        rmse = compute_rmse(y_pred,y_test)
+        rmse = compute_rmse(y_pred, y_test)
         self.mlflow_log_metric("rmse", rmse)
         return round(rmse, 2)
 
+    def save_model(self):
+        """Save the model into a .joblib format"""
+        joblib.dump(self.pipeline, 'model.joblib')
+        print(colored("model.joblib saved locally", "green"))
+
+    def save_model_to_gcp(reg):
+        """Save the model into a .joblib and upload it on Google Storage /models folder
+        HINTS : use sklearn.joblib (or jbolib) libraries and google-cloud-storage"""
+        from sklearn.externals import joblib
+        local_model_name = 'model.joblib'
+        # saving the trained model to disk (which does not really make sense
+        # if we are running this code on GCP, because then this file cannot be accessed once the code finished its execution)
+        joblib.dump(reg, local_model_name)
+        print("saved model.joblib locally")
+        client = storage.Client().bucket(BUCKET_NAME)
+        storage_location = f"models/{MODEL_NAME}/{MODEL_VERSION}/{local_model_name}"
+        blob = client.blob(storage_location)
+        blob.upload_from_filename(local_model_name)
+        print("uploaded model.joblib to gcp cloud storage under \n => {}".format(storage_location))
+
+    # MLFlow methods
     @memoized_property
     def mlflow_client(self):
         mlflow.set_tracking_uri(MLFLOW_URI)
@@ -73,7 +102,8 @@ class Trainer():
         try:
             return self.mlflow_client.create_experiment(self.experiment_name)
         except BaseException:
-            return self.mlflow_client.get_experiment_by_name(self.experiment_name).experiment_id
+            return self.mlflow_client.get_experiment_by_name(
+                self.experiment_name).experiment_id
 
     @memoized_property
     def mlflow_run(self):
@@ -87,20 +117,19 @@ class Trainer():
 
 
 if __name__ == "__main__":
-    # get data
-    df = get_data()
-    # clean data
-    clean_df = clean_data(df)
-    # set X and y
-    y = clean_df['fare_amount']
-    X = clean_df.drop(columns=['fare_amount'])
-    # hold out
-    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.1, random_state=42)
-    # train
-    trainer = Trainer(X_train,y_train)
-    trainer.set_pipeline()
+    # Get and clean data
+    N = 100
+    df = get_data(nrows=N)
+    # ⚠️ alternatively use data from gcp with get_data_from_gcp
+    df = clean_data(df)
+    y = df["fare_amount"]
+    X = df.drop("fare_amount", axis=1)
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3)
+    # Train and save model, locally and
+    trainer = Trainer(X=X_train, y=y_train)
+    trainer.set_experiment_name('xp2')
     trainer.run()
-    trainer.evaluate(X_val,y_val)
-
-
-    # evaluate
+    rmse = trainer.evaluate(X_test, y_test)
+    print(f"rmse: {rmse}")
+    trainer.save_model()
+    #trainer.save_model_to_gcp()
