@@ -21,3 +21,4 @@ gcsfs
 google-cloud-storage
 termcolor
 uvicorn
+fastapi
